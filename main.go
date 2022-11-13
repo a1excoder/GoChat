@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -103,33 +104,39 @@ func GetMessageData(connection net.Conn) ([]byte, error) {
 }
 
 func ClientWorker(connection net.Conn, channel chan struct{}) {
-	UserName, stat, err := Validate(connection)
-	if err != nil {
-		if stat {
-			if err := SendErrorMsg(connection, err.Error()); err != nil {
-				log.Println(err.Error())
-			}
-		} else {
-			log.Println(err.Error())
-		}
-
-		return
-	}
-
 	defer func() {
 		log.Printf("client(%s) disconnected\n", connection.RemoteAddr().String())
-		connection.Close()
 
 		usersDB.userDbMutex.Lock()
 		delete(usersDB.usersDB, &connection)
 		usersDB.userDbMutex.Unlock()
 
-		if err := SendNotification(fmt.Sprintf("user \"%s\" has left the chat", UserName)); err != nil {
-			log.Println(err.Error())
-		}
+		_ = connection.Close()
 
+		//if err := SendNotification(fmt.Sprintf("user \"%s\" has left the chat", UserName)); err != nil {
+		//	log.Println(err.Error())
+		//}
+
+		<-channel
 		log.Printf("max: %d / now: %d\n", cap(channel), len(channel))
 	}()
+
+	UserName, stat, err := Validate(connection)
+	if err != nil {
+		if stat {
+			if err := SendErrorMsg(connection, err.Error()); err != nil {
+				log.Println(err)
+			}
+		} else {
+			if err == io.EOF {
+				log.Println(err, "read error from connection")
+			} else {
+				log.Println(err)
+			}
+		}
+
+		return
+	}
 
 	msgData := MessageData{}
 	onlineUsersData := OnlineUsersData{}
@@ -139,29 +146,33 @@ func ClientWorker(connection net.Conn, channel chan struct{}) {
 	for {
 		n, err = connection.Read(data)
 		if err != nil {
-			log.Printf(err.Error())
+			log.Println(err)
 			if err := SendErrorMsg(connection, "unknown server error"); err != nil {
-				log.Println(err.Error())
+				log.Println(err)
 			}
 			return
 		}
 
 		if err = msgData.UnmarshalMsgData(data[:n]); err != nil {
-			log.Printf(err.Error())
-			_ = SendErrorMsg(connection, "failed to convert message")
+			log.Println(err)
+			if err = SendErrorMsg(connection, "failed to convert message"); err != nil {
+				log.Println(err)
+			}
 			continue
 		}
 
 		switch msgData.MessageTypeStatus {
 		case SendMessageT:
 			if err = ReSendMessage(UserName, msgData.Data, connection); err != nil {
-				log.Println(err.Error())
+				log.Println(err)
 
 				if err = SendErrorMsg(connection, "unknown server error"); err != nil {
-					log.Println(err.Error())
+					log.Println(err)
 				}
 			}
+			break
 		case GetOnlineUsers:
+			// need set time
 			usersDB.userDbMutex.Lock()
 
 			onlineUsersData.Count = len(usersDB.usersDB)
@@ -175,27 +186,28 @@ func ClientWorker(connection net.Conn, channel chan struct{}) {
 
 			msgData.MessageTypeStatus = OnlineUsers
 			if msgData.Data, err = json.Marshal(onlineUsersData); err != nil {
-				log.Println(err.Error())
+				log.Println(err)
 
 				if err := SendErrorMsg(connection, "unknown server error"); err != nil {
-					log.Println(err.Error())
+					log.Println(err)
 				}
 				continue
 			}
 
 			if data, err = json.Marshal(msgData); err != nil {
-				log.Println(err.Error())
+				log.Println(err)
 				err := SendErrorMsg(connection, "unknown server error")
 				if err != nil {
-					log.Println(err.Error())
+					log.Println(err)
 				}
 				continue
 			}
 
 			if _, err = connection.Write(data); err != nil {
-				log.Println(err.Error())
+				log.Println(err)
 			}
 
+			break
 		}
 	}
 }
@@ -232,6 +244,7 @@ func Validate(connection net.Conn) (string, bool, error) {
 	msgData := MessageData{}
 	loginMsgData := LoginMessageData{}
 
+	// return EOF if didn't read anything from connection
 	btData, err := GetMessageData(connection)
 	if err != nil {
 		return "", false, err
@@ -273,7 +286,9 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	defer listener.Close()
+	defer func() {
+		_ = listener.Close()
+	}()
 
 	log.Printf("Server is listening [%s:%s]\n", confFile.Host, confFile.Port)
 	var connection net.Conn
